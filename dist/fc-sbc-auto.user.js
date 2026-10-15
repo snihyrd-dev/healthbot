@@ -164,6 +164,8 @@ const FCSBC = (() => {
     protectSpecial: true,   // особые карточки (TOTW, промо) не трогаем
     maxRepeats: 1,          // сколько раз подряд выполнить повторяемый SBC
     submit: true,           // true = отправлять сам; false = только заполнить
+    maxCost: 0,             // 0 = без лимита ценности; иначе пропускать дорогие
+    onlyNames: [],          // подстроки названий наборов; пусто = все
     delayMin: 900, delayMax: 2200,
   }, JSON.parse(localStorage.getItem('fcsbc.cfg') || '{}'));
 
@@ -278,6 +280,39 @@ const FCSBC = (() => {
     }
   }
 
+
+  // --- Пакетный режим: все открытые SBC подряд ---
+  // Пропускает: завершённые, неизвестные требования, не собираемые из клуба, дороже maxCost.
+  async function runBatch(report) {
+    let club = await loadClub();
+    const sets = (await call(services.SBC.requestSets())).data.sets
+      .filter((s) => !s.isComplete || !s.isComplete());
+    const log = [];
+    for (const set of sets) {
+      if (cfg.onlyNames && cfg.onlyNames.length && !cfg.onlyNames.some((n) => set.name.includes(n))) continue;
+      const chs = (await call(services.SBC.requestChallengesForSet(set))).data.challenges;
+      for (const ch of chs) {
+        if (ch.isCompleted && ch.isCompleted()) continue;
+        const tag = `${set.name} / ${ch.name}`;
+        try {
+          await call(services.SBC.loadChallenge(ch));
+          const req = parseRequirements(ch);
+          if (!req) { log.push([tag, 'пропуск: неизвестное требование']); continue; }
+          const res = FCSBC.solve(club, req, { protectRating: cfg.protectRating, protectSpecial: cfg.protectSpecial });
+          if (!res.ok) { log.push([tag, 'пропуск: не собирается']); continue; }
+          if (cfg.maxCost && res.cost > cfg.maxCost) { log.push([tag, `пропуск: дорого (${Math.round(res.cost)})`]); continue; }
+          const used = await runChallenge(ch, set, club);
+          club = club.filter((p) => !used.has(p.id));
+          log.push([tag, 'выполнено']);
+        } catch (e) { log.push([tag, 'ошибка: ' + (e.message || e)]); }
+        report && report(log);
+        await jitter(cfg.delayMin * 2, cfg.delayMax * 3);
+      }
+    }
+    LOG('итог пакета', log);
+    return log;
+  }
+
   // --- UI: кнопка на экране состава SBC ---
   function inject() {
     const proto = UTSBCSquadOverviewViewController.prototype;
@@ -305,9 +340,32 @@ const FCSBC = (() => {
     };
   }
 
+  function injectHub() {
+    if (typeof UTSBCHubViewController === 'undefined') return;
+    const proto = UTSBCHubViewController.prototype, orig = proto.viewDidAppear;
+    proto.viewDidAppear = function (...a) {
+      const r = orig.apply(this, a);
+      if (!document.getElementById('fcsbc-batch')) {
+        const b = document.createElement('button');
+        b.id = 'fcsbc-batch'; b.textContent = '⚡ Пакет SBC';
+        Object.assign(b.style, { position: 'fixed', right: '16px', bottom: '16px', zIndex: 99999, padding: '12px 18px', borderRadius: '8px', background: '#238636', color: '#fff', border: 0, cursor: 'pointer', font: '600 15px sans-serif' });
+        b.onclick = async () => {
+          b.disabled = true;
+          try { const log = await runBatch((l) => { b.textContent = `… ${l.length}`; }); b.textContent = `✔ ${log.filter((x) => x[1] === 'выполнено').length}/${log.length}`; }
+          catch (e) { LOG('ошибка', e); b.textContent = '✖ ошибка'; }
+          b.disabled = false;
+        };
+        document.body.appendChild(b);
+      }
+      return r;
+    };
+    const o2 = proto.viewDidDisappear;
+    proto.viewDidDisappear = function (...a) { const b = document.getElementById('fcsbc-batch'); if (b) b.remove(); return o2 ? o2.apply(this, a) : undefined; };
+  }
+
   const wait = setInterval(() => {
     if (typeof services !== 'undefined' && services.Club && typeof UTSBCSquadOverviewViewController !== 'undefined') {
-      clearInterval(wait); inject(); LOG('готов');
+      clearInterval(wait); inject(); injectHub(); LOG('готов');
     }
   }, 1000);
 })();
